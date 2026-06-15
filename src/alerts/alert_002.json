@@ -1,0 +1,6 @@
+{
+  "date": "2026-06-14",
+  "title": "High disk usage",
+  "description": "Check disk usage on the machine and write a summary to a local file.",
+  "machine": 102
+}

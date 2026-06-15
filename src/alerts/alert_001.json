@@ -1,0 +1,7 @@
+{
+  "date": "2026-06-14",
+  "title": "Pull machine logs",
+  "description": "Pull machine logs and print them to local files.",
+  "machine": 101,
+  "read": true
+}
