@@ -100,8 +100,8 @@ The orchestrator does not interact with the Claude Agent SDK directly — that b
 ## Stage Gate Tracker
 
 - [x] Stage 1 Mermaid approved
-- [ ] Stage 2 Flows approved
-- [ ] Stage 3 Logs + Deployment approved or skipped
+- [x] Stage 2 Flows approved
+- [x] Stage 3 Logs + Deployment approved or skipped
 
 ## Mermaid Diagram
 
@@ -255,6 +255,39 @@ Launch a fresh Claude Agent SDK session for a pending alert by delegating to the
 
 ---
 
+### Flow: `resumeStalledAgent`
+- Test files: `tests/test_orchestrator.py`
+- Core files: `orchestrator.py` — `resume_stalled_agent()` / `timeout_tick()`, agent-environment-runtime (`agent_env_runtime.py`), `src/alerts/status.json`
+
+#### Intent
+
+A periodic timeout timer tick inspects every alert whose `StatusRecord.status == "running"` and whose `timeout_at` has passed. For each, check whether the `agent_id` corresponds to a live process via the orchestrator's in-memory running-agent table. If alive → re-arm the timeout (push `timeout_at` forward). If gone → call `agent_env_runtime.resume_agent(agent_id, resume_prompt)` to re-enter the conversation from the `FilesystemSessionStore` / `session.json`, then re-arm the timeout.
+
+#### Paths
+
+| path | input | output | path-type | notes |
+| --- | --- | --- | --- | --- |
+| `resumeStalledAgent.alive-rearm` | running alert, `timeout_at` passed, agent still alive | re-armed `StatusRecord` (`timeout_at` pushed forward) | no-op recovery path | no process termination; timeout re-armed for next check |
+| `resumeStalledAgent.resume-success` | running alert, `timeout_at` passed, agent gone | `ResumeOutput` | happy recovery path | status stays `"running"`, timeout re-armed, new `session_id` persisted |
+| `resumeStalledAgent.resume-error` | `resume_agent()` raises exception | `StandardError` | error | alert stays `"running"` with re-armed timeout so it is retried next tick |
+| `resumeStalledAgent.session-missing` | no `session.json` / session store for `agent_id` | `StandardError` | error | cannot resume, logged for manual inspection, alert stays `"running"` |
+
+#### Steps
+
+1. **On timer tick, read and filter `status.json`.** Read the full status record from `src/alerts/status.json` and select only alerts with `status: "running"` and `timeout_at` in the past (ISO timestamp comparison). Maintain the in-memory running-agent table as the source of truth for liveness.
+
+2. **For each stalled alert, check the in-memory running-agent table for liveness.** Look up the `agent_id` in the orchestrator's running-agent table. If an entry exists, the agent is still running.
+
+3. **If alive, re-arm the timeout.** Update the `StatusRecord` by pushing `timeout_at` forward by `TIMEOUT_INTERVAL` and write the updated record to `status.json` (atomic write). Continue to the next alert without calling the runtime.
+
+4. **If gone, load the session and call `resume_agent()`.** Read `agents/<agent-id>/session.json` to extract the stored `session_id`. Construct a `resume_prompt` (the original alert description, prefixed with a standard recovery message like `"The previous agent session timed out. Please continue."`) and call `await agent_env_runtime.resume_agent({ agent_id, session_id, resume_prompt })`.
+
+5. **On success, persist the new session_id and re-arm timeout.** The runtime returns a `ResumeOutput` with `agent_output` and (possibly new) `session_id`. Persist the `session_id` back to `agents/<agent-id>/session.json`, update the `StatusRecord` with re-armed `timeout_at`, and write to `status.json` (atomic write). Status remains `"running"`.
+
+6. **On error or missing session, log and re-arm without resume.** If `resume_agent()` raises an exception or if `session.json` does not exist, emit a `StandardError` to the log. Update the `StatusRecord` with re-armed `timeout_at` and write to `status.json`. The next timeout tick will retry. Do not remove the alert from the running-agent table.
+
+---
+
 ### Flow: `consumeRecommendation`
 - Test files: `tests/test_orchestrator.py`
 - Core files: `orchestrator.py` — `consume_recommendation()`, `src/alerts/status.json`
@@ -283,8 +316,84 @@ After an agent finishes (the runtime returns a `SpawnOutput` or `ResumeOutput`),
 
 ## Logs
 
-_TODO_
+Structured log format: `flow | step | data`. All fields in `data` are JSON-serialisable scalars unless noted. Logs are written to stdout so the host process supervisor can capture them.
+
+| flow | step | example data |
+| --- | --- | --- |
+| `pollCycle` | `start` | `{ poll_cycle: 42, alerts_scanned: 5 }` |
+| `pollCycle` | `scan-result` | `{ pending: 2, running: 2, done: 1 }` |
+| `ingestAlert` | `template-selected` | `{ alert_file, title, template_file }` |
+| `ingestAlert` | `no-template` | `{ alert_file, title }` |
+| `ingestAlert` | `malformed-alert` | `{ alert_file, error }` |
+| `spawnAgent` | `agent-id-assigned` | `{ alert_file, agent_id }` |
+| `spawnAgent` | `success` | `{ alert_file, agent_id, session_id }` |
+| `spawnAgent` | `runtime-error` | `{ alert_file, agent_id, error }` |
+| `spawnAgent` | `workdir-collision` | `{ alert_file, agent_id }` |
+| `resumeStalledAgent` | `timeout-tick` | `{ running_alerts: 3, stalled: 1 }` |
+| `resumeStalledAgent` | `alive-rearm` | `{ agent_id, alert_file, new_timeout_at }` |
+| `resumeStalledAgent` | `resume-success` | `{ agent_id, alert_file, session_id, new_timeout_at }` |
+| `resumeStalledAgent` | `resume-error` | `{ agent_id, alert_file, error }` |
+| `resumeStalledAgent` | `session-missing` | `{ agent_id, alert_file }` |
+| `consumeRecommendation` | `done` | `{ alert_file, agent_id, output_length }` |
+| `consumeRecommendation` | `status-write-error` | `{ alert_file, agent_id, error }` |
+| `consumeRecommendation` | `duplicate-done` | `{ alert_file, agent_id }` |
+
+**Notes:**
+- `output_length` is `len(agent_output)` in characters — it avoids embedding raw multi-line output in the log line.
+- Every error step logs the exception `message` (not the full traceback) in the `error` field; the full traceback is written to stderr at DEBUG level.
+- `pollCycle | start` marks the beginning of each pass through `src/alerts/`; `pollCycle | scan-result` marks the end so each poll cycle is bookended in logs.
 
 ## Deployment
 
-_TODO_
+### Entrypoint
+
+The orchestrator is a single long-lived Python async process. Start it with:
+
+```bash
+python orchestrator.py
+```
+
+No additional arguments are required. All configuration is read from environment variables at startup (see below). The process runs indefinitely until it receives `SIGINT` or `SIGTERM`.
+
+### Async Drivers
+
+The process runs two independent async loops that share the same event loop:
+
+| driver | env var | default | description |
+| --- | --- | --- | --- |
+| Poll loop | `POLL_INTERVAL` | `10` (seconds) | Wakes every `POLL_INTERVAL` seconds, scans `src/alerts/`, and calls `ingestAlert` + `spawnAgent` for any `pending` alerts. |
+| Timeout timer | `TIMEOUT_INTERVAL` | `60` (seconds) | Wakes every `TIMEOUT_INTERVAL` seconds, reads `status.json`, and calls `resumeStalledAgent` for any `running` alert whose `timeout_at` has passed. |
+
+Both intervals are read once at startup. Changing them requires a process restart.
+
+### Required Environment
+
+| variable | required | description |
+| --- | --- | --- |
+| `ANTHROPIC_API_KEY` | yes | Credential forwarded to the Claude Agent SDK by the agent-environment-runtime layer. |
+| `POLL_INTERVAL` | no | Poll loop interval in seconds. Defaults to `10`. |
+| `TIMEOUT_INTERVAL` | no | Timeout timer interval and the duration added to `timeout_at` on spawn or re-arm. Defaults to `60`. |
+
+The process also requires two working directories to exist at startup:
+- `agents/` — root for per-agent isolated folders (`agents/<agent-id>/`). The orchestrator creates subdirectories as needed but does not create the root.
+- `src/alerts/` — directory watched for incoming alert JSON files. Must be readable and writable (the orchestrator reads alert files and writes `status.json` into this directory).
+
+### State Durability and Restart Recovery
+
+All durable state lives on disk:
+
+- `src/alerts/status.json` — the alert state machine. On startup the orchestrator reads this file and re-hydrates its in-memory running-agent table from any records with `status: "running"`. These alerts are immediately subject to the next timeout tick and will be resumed if their agent process is gone.
+- `agents/<agent-id>/` — isolated workspace per agent, including `session.json` and the `FilesystemSessionStore`. These directories are never deleted by the orchestrator, so a crashed process leaves full session state for resume.
+
+Because all state is on disk, a clean restart (crash or intentional) does not drop alerts. The process picks up exactly where it left off within at most one `TIMEOUT_INTERVAL` delay for any alert that was `running` at the time of the crash.
+
+### Graceful Shutdown
+
+On `SIGINT` or `SIGTERM` the orchestrator:
+
+1. Stops accepting new poll-loop iterations (no new `spawnAgent` calls).
+2. Waits for any in-flight `spawn_agent()` or `resume_agent()` calls that are already awaited to complete (up to a short drain timeout, e.g. 5 seconds).
+3. Writes a final `status.json` flush if any in-flight completions were received during the drain.
+4. Exits with code `0`.
+
+Alerts that were mid-flight but not yet drained remain in `status: "running"` in `status.json` and are recovered on the next startup via the timeout timer.

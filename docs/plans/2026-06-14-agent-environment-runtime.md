@@ -2,9 +2,9 @@
 
 ## System Intent
 
-- **What is being built**: A lightweight Python runtime that spawns and resumes Claude Code sub-agents using the Claude Agent SDK's session persistence feature. The runtime seeds each agent with an alert.json in its context at spawn time, captures and persists the session_id to external storage (a custom FilesystemSessionStore rooted in the agent's own folder), and allows crash-recovered agents to resume their prior conversation.
+- **What is being built**: A lightweight Python runtime that spawns and resumes Claude Code sub-agents using the Claude Agent SDK's session persistence feature. The runtime seeds each agent with an alert.json in its context at spawn time, captures and persists the session_id to external storage (a custom FilesystemSessionStore rooted in the agent's own folder), and allows crash-recovered agents to resume their prior conversation. It also exposes a **single sanctioned egress** — a custom in-process SDK tool (`submit_recommendation`) that the agent calls to push its recommendation/status into the recommendations flow via the **core API** — so the agent can report results without ever writing outside its own folder.
 - **Primary consumer(s)**: The orchestrator (`orchestrator.py`), which calls `spawn_agent()` to start a fresh sub-agent seeded with an alert, and `resume_agent()` when a crashed agent needs to resume.
-- **Boundary (black-box scope only)**: The Claude Agent SDK (`claude_agent_sdk` Python package) and the Anthropic API. The plan documents how the orchestrator calls the SDK; the SDK and API internals are not modified.
+- **Boundary (black-box scope only)**: The Claude Agent SDK (`claude_agent_sdk` Python package), the Anthropic API, and the **Core API** — the orchestrator / recommendation-queue endpoint that adds recommendations and tracks alert status (defined in `01_orchestrator_plan.md` and `03_recommendation_queue_plan.md`). This runtime *calls* the Core API (through an injected `CoreApiClient`) but does not implement it.
 
 ## Critical Context (Prior Verified Investigations)
 
@@ -28,10 +28,23 @@ Per official Agent SDK documentation (https://code.claude.com/docs/en/agent-sdk/
 
 With a FilesystemSessionStore rooted at `./agents/<agent-id>/sessions/`, the transcript is persisted **within the agent's own folder**, not scattered across the host's `~/.claude/`. This makes spawn+resume self-contained and host-independent: the session_id is captured in `./agents/<agent-id>/session.json`, and all conversation history lives in `./agents/<agent-id>/sessions/` under the custom store.
 
+### Recommendation Egress: the "Core API" Pipe
+
+The agent must be able to save its recommendation/status, yet it stays **write-confined to `./agents/<agent-id>/`** (it cannot write external files). These are reconciled with a single sanctioned egress implemented as a custom in-process SDK tool (per https://code.claude.com/docs/en/agent-sdk/custom-tools):
+
+- **Define** with `@tool(name, description, schema)`; the handler is `async def handler(args: dict) -> {"content": [...], "is_error"?: bool}`.
+- **Bundle** with `create_sdk_mcp_server(name="core", version="1.0.0", tools=[submit_recommendation])`. This server runs **in-process inside the runtime**, not as a separate process.
+- **Register** via `ClaudeAgentOptions(mcp_servers={"core": server}, allowed_tools=["mcp__core__submit_recommendation"])`. The agent sees the tool as `mcp__core__submit_recommendation` (pattern `mcp__{server}__{tool}`).
+- **Errors**: the handler returns `is_error: True` to keep the agent loop alive; an *uncaught* exception ends the whole `query()` call.
+
+**Why this preserves isolation:** the tool *handler* executes in the trusted runtime process — not in the confined agent sandbox — so the runtime (not the agent) performs the actual `core_api.add_recommendation(...)` call. The agent's only new capability is *requesting* the tool; it gains no filesystem or network access beyond its folder. This is the one auditable pipe through which recommendations and status leave the agent.
+
 ## Stage Gate Tracker
 
-- [x] Stage 1 Mermaid approved
-- [x] Stage 2 Flows approved
+> Revised after initial approval to add the recommendation egress (core-API pipe). Stages 1 & 2 re-opened for re-approval.
+
+- [ ] Stage 1 Mermaid approved (revised: recommendation pipe added)
+- [ ] Stage 2 Flows approved (revised: `submitRecommendation` flow added)
 
 ## Mermaid Diagram
 
@@ -48,6 +61,11 @@ graph TD
   ResumeFlow -->|"query(prompt, options=ClaudeAgentOptions(resume=session_id, session_store=store, ...))"| SDKResume["Claude Agent SDK Resume"]:::created
   SDKResume -->|"loads entries from SessionStore"| SessionDirLocal
   SDKResume -->|"returns agent output"| Orch
+  SDKQuery -->|"agent calls mcp__core__submit_recommendation"| CoreTool["submit_recommendation — in-process SDK tool, trusted runtime"]:::created
+  SDKResume -->|"agent calls mcp__core__submit_recommendation"| CoreTool
+  CoreTool -->|"core_api.add_recommendation(Recommendation)"| CoreAPI["Core API — orchestrator / rec-queue endpoint"]:::unchanged
+  CoreAPI -->|"append + persist status"| RecQueue["Recommendation Queue → local DB"]:::unchanged
+  RecQueue -->|"pull when free"| Orch
 
   classDef unchanged fill:#d3d3d3,stroke:#666,stroke-width:1px;
   classDef updated fill:#ffe58a,stroke:#666,stroke-width:1px;
@@ -90,13 +108,27 @@ ResumeOutput {
   agent_output:  string   — the agent's continuation output
   session_id:    string   — session_id (may be same as input, or updated by SDK)
 }
+
+Recommendation {
+  alert_id:  string        — the alert this recommendation addresses (agent supplies; it has the alert in context)
+  agent_id:  string        — the producing agent (bound by the runtime, NOT supplied by the agent)
+  summary:   string        — short human-readable recommendation
+  actions:   list[string]  — ordered recommended actions (optional)
+  status:    string        — terminal status saved for the alert: "done" | "needs_human" | "no_action"
+}
+
+CoreApiClient {
+  # Boundary — injected into spawn_agent/resume_agent; implemented in 01/03.
+  # The single call the runtime makes on the agent's behalf.
+  add_recommendation(rec: Recommendation) -> None   — call the core API to append rec to the flow and persist status
+}
 ```
 
 ---
 
 ### Flow: `spawnAgent`
 - Test files: `tests/test_agent_environment.py`
-- Core files: `orchestrator.py` — `spawn_agent()`, `FilesystemSessionStore` class
+- Core files: `orchestrator.py` — `spawn_agent()`, `FilesystemSessionStore` class, `build_core_tool_server()`, `submit_recommendation` tool
 
 #### Description
 
@@ -106,9 +138,10 @@ Start a fresh Claude Agent SDK query, seeded with an alert in the initial prompt
 
 ```txt
 SpawnInput {
-  agent_id:  string  (required, UUID; used as folder name)
-  alert:     dict    (required, parsed alert.json object)
-  prompt:    string  (required, full rendered prompt: template + alert block)
+  agent_id:  string         (required, UUID; used as folder name)
+  alert:     dict           (required, parsed alert.json object)
+  prompt:    string         (required, full rendered prompt: template + alert block)
+  core_api:  CoreApiClient  (required, injected; the tool handler calls it to add the recommendation)
 }
 
 SpawnOutput {
@@ -125,6 +158,9 @@ SpawnOutput {
 | `spawnAgent.workdir-collision` | `SpawnInput` with existing agent_id | `StandardError` | error | agent_id collision; orchestrator must generate a fresh UUID and retry |
 | `spawnAgent.session-store-error` | `SpawnInput` | `StandardError` | error | SessionStore.append() failed (mirror_error); logged but does not block completion (local copy is durable) |
 | `spawnAgent.sdk-error` | `SpawnInput` | `StandardError` | error | SDK query raised exception or iteration terminated without ResultMessage |
+| `spawnAgent.recommendation-submitted` | agent invokes `mcp__core__submit_recommendation` | recommendation added via Core API | happy path | tool handler (trusted runtime) calls `core_api.add_recommendation`; this is how the result enters the flow |
+| `spawnAgent.core-api-error` | tool handler's `core_api` call fails | tool returns `is_error: True` | error | handler catches the failure and returns `is_error: True` so the agent loop continues (it can retry or explain); never throws |
+| `spawnAgent.no-recommendation` | agent ends without calling the tool | `StandardError` | error | runtime observed no `submit_recommendation` ToolUseBlock before ResultMessage; the alert produced no recommendation |
 
 #### Pseudocode
 
@@ -143,17 +179,27 @@ async def spawn_agent(input: SpawnInput) -> SpawnOutput:
     # 3. Seed the alert into the prompt context
     full_prompt = f"{input.prompt}\\n\\n## Alert\\n{json.dumps(input.alert, indent=2)}"
     
-    # 4. Query the SDK
-    from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
+    # 4. Build the core-API pipe (one sanctioned egress) and query the SDK
+    from claude_agent_sdk import (
+        query, ClaudeAgentOptions, ResultMessage, AssistantMessage, ToolUseBlock,
+    )
+    core_server = build_core_tool_server(input.core_api, input.agent_id)  # see submitRecommendation flow
     options = ClaudeAgentOptions(
         session_store=store,
+        mcp_servers={"core": core_server},
+        allowed_tools=["Read", "Edit", "Bash", "Write", "mcp__core__submit_recommendation"],
         # Optionally: env={ "CLAUDE_CONFIG_DIR": "/tmp/..." } for ephemeral local copy
     )
     
     session_id = None
     agent_output = None
+    recommendation_submitted = False
     async for message in query(prompt=full_prompt, options=options):
-        if isinstance(message, ResultMessage):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, ToolUseBlock) and block.name == "mcp__core__submit_recommendation":
+                    recommendation_submitted = True   # agent pushed its result through the pipe
+        elif isinstance(message, ResultMessage):
             agent_output = message.result
             session_id = message.session_id
             # Stop iterating; result marks end of conversation
@@ -164,6 +210,8 @@ async def spawn_agent(input: SpawnInput) -> SpawnOutput:
     
     if not session_id:
         raise StandardError("SDK query did not return a ResultMessage with session_id")
+    if not recommendation_submitted:
+        raise StandardError("Agent finished without calling submit_recommendation")
     
     # 5. Persist session_id for crash-recovery
     session_file = f"{agent_dir}/session.json"
@@ -177,7 +225,7 @@ async def spawn_agent(input: SpawnInput) -> SpawnOutput:
 
 ### Flow: `resumeAgent`
 - Test files: `tests/test_agent_environment.py`
-- Core files: `orchestrator.py` — `resume_agent()`, `FilesystemSessionStore` class
+- Core files: `orchestrator.py` — `resume_agent()`, `FilesystemSessionStore` class, `build_core_tool_server()`
 
 #### Description
 
@@ -187,8 +235,9 @@ Load the persisted session_id from `agents/<agent-id>/session.json`, re-create t
 
 ```txt
 ResumeInput {
-  agent_id:       string   (required, must match original spawn)
-  resume_prompt:  string   (required, continuation prompt; e.g., "Continue from where you left off.")
+  agent_id:       string         (required, must match original spawn)
+  resume_prompt:  string         (required, continuation prompt; e.g., "Continue from where you left off.")
+  core_api:       CoreApiClient  (required, injected; same pipe as spawn so a resumed agent can still submit)
 }
 
 ResumeOutput {
@@ -228,11 +277,14 @@ async def resume_agent(input: ResumeInput) -> ResumeOutput:
     if entries is None:
         raise StandardError(f"SessionStore.load() returned None for session {session_id}; history was lost")
     
-    # 3. Resume via SDK
-    from claude_agent_sdk import query, ClaudeAgentOptions
+    # 3. Resume via SDK (re-attach the same core-API pipe)
+    from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
+    core_server = build_core_tool_server(input.core_api, input.agent_id)
     options = ClaudeAgentOptions(
         resume=session_id,
         session_store=store,
+        mcp_servers={"core": core_server},
+        allowed_tools=["Read", "Edit", "Bash", "Write", "mcp__core__submit_recommendation"],
     )
     
     agent_output = None
@@ -254,6 +306,85 @@ async def resume_agent(input: ResumeInput) -> ResumeOutput:
     
     return ResumeOutput(agent_output=agent_output, session_id=result_session_id)
 ```
+
+---
+
+### Flow: `submitRecommendation` (the Core API pipe)
+- Test files: `tests/test_agent_environment.py`
+- Core files: `orchestrator.py` — `build_core_tool_server()`, `submit_recommendation` tool
+
+#### Description
+
+The single sanctioned egress. `build_core_tool_server()` constructs an in-process SDK MCP server holding one tool, `submit_recommendation`, bound to the injected `CoreApiClient` and the current `agent_id`. The agent calls the tool to save its recommendation + terminal status; the handler — running in the **trusted runtime**, not the confined sandbox — performs the actual `core_api.add_recommendation(...)` call. The agent never writes outside its own folder.
+
+#### Types
+
+```txt
+SubmitRecommendationArgs {        # what the agent passes to the tool
+  alert_id: string       (required)
+  summary:  string       (required)
+  actions:  list[string] (optional)
+  status:   string       (required, enum: "done" | "needs_human" | "no_action")
+}
+
+ToolResult {                      # MCP CallToolResult shape the handler returns
+  content:  list[block]   — e.g. [{ "type": "text", "text": "..." }]
+  is_error: bool          — optional; True keeps the agent loop alive on failure
+}
+```
+
+#### Paths
+
+| path | input | output | path-type | notes |
+| --- | --- | --- | --- | --- |
+| `submitRecommendation.success` | `SubmitRecommendationArgs` | `ToolResult` (text ok) | happy path | handler builds Recommendation (binds agent_id), calls `core_api.add_recommendation`, returns success text |
+| `submitRecommendation.core-api-error` | `SubmitRecommendationArgs` | `ToolResult` with `is_error=True` | error | core API call raised; caught and returned as `is_error` so the agent can retry/explain (loop stays alive) |
+| `submitRecommendation.bad-args` | missing required field | `ToolResult` with `is_error=True` | error | SDK validates against the schema; handler also guards required fields |
+
+#### Pseudocode
+
+```
+from claude_agent_sdk import tool, create_sdk_mcp_server
+
+def build_core_tool_server(core_api: CoreApiClient, agent_id: str):
+    """Construct the per-agent in-process MCP server that holds the one egress tool."""
+
+    @tool(
+        "submit_recommendation",
+        "Save the recommendation and terminal status for the current alert. "
+        "Call this exactly once when you have a final recommendation.",
+        {
+            "type": "object",
+            "properties": {
+                "alert_id": {"type": "string", "description": "id of the alert this addresses"},
+                "summary":  {"type": "string", "description": "short human-readable recommendation"},
+                "actions":  {"type": "array", "items": {"type": "string"},
+                             "description": "ordered recommended actions"},
+                "status":   {"type": "string", "enum": ["done", "needs_human", "no_action"],
+                             "description": "terminal status to save for the alert"},
+            },
+            "required": ["alert_id", "summary", "status"],
+        },
+    )
+    async def submit_recommendation(args: dict) -> dict:
+        try:
+            core_api.add_recommendation(Recommendation(
+                alert_id=args["alert_id"],
+                agent_id=agent_id,                 # bound by runtime — agent cannot spoof it
+                summary=args["summary"],
+                actions=args.get("actions", []),
+                status=args["status"],
+            ))
+            return {"content": [{"type": "text", "text": "Recommendation saved."}]}
+        except Exception as e:
+            # Return is_error instead of raising so the agent loop continues
+            return {"content": [{"type": "text", "text": f"Failed to save recommendation: {e}"}],
+                    "is_error": True}
+
+    return create_sdk_mcp_server(name="core", version="1.0.0", tools=[submit_recommendation])
+```
+
+> Note: the same `core` server can carry interim status updates (e.g. an `update_status`/`heartbeat` tool) if the orchestrator's liveness check needs them; out of scope here — this plan ships the single `submit_recommendation` tool.
 
 ---
 
